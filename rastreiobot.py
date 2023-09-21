@@ -1,17 +1,16 @@
+import asyncio
 import configparser
 import logging.handlers
 import random
+from rastreio.providers.correios import Correios
 import webhook
 from datetime import datetime, timedelta
-from time import time
 from collections import defaultdict
 
 import requests
-import sentry_sdk
 import telebot
 
-import apis.apicorreios as correios
-from utils.misc import check_type, send_clean_msg, check_package, check_update
+from utils.misc import check_type, send_clean_msg, check_package
 from telebot import types
 
 import utils.msgs as msgs
@@ -22,6 +21,7 @@ config = configparser.ConfigParser()
 config.read('bot.conf')
 
 TOKEN = config['RASTREIOBOT']['TOKEN']
+CORREIOS_TOKEN = config["CORREIOS"]["token"]
 LOG_INFO_FILE = config['RASTREIOBOT']['text_log']
 LOG_ROUTINE_FILE = config['RASTREIOBOT']['routine_log']
 LOG_ALERTS_FILE = config['RASTREIOBOT']['alerts_log']
@@ -61,7 +61,7 @@ def count_packages():
     for elem in cursor:
         if len(elem['code']) > 13:
             pkg_status['trackingmore'] += 1
-        if 'Aguardando recebimento pel' in str(elem):
+        if 'Aguardando recebimento pel' in str(elem) or 'Aguardando atualizações' in str(elem):
             pkg_status['wait'] += 1
         else:
             pkg_status['qtd'] += 1
@@ -96,7 +96,7 @@ def send_status_sorted(bot, chatid, case, status):
     cases = {
         1: '<b>Aguardando pagamento</b> 🔫',
         2: '<b>Pagamento confirmado</b> 💸',
-        3: '<b>Aguardando recebimento pela ECT</b> 🕒',
+        3: '<b>Aguardando atualizações</b> 🕒',
         4: '<b>Fiscalização aduaneira finalizada</b>',
         5: '<b>Objeto em trânsito </b> 🚃',
         6: '<b>Objeto saiu para entrega ao destinatário</b> 🚚',
@@ -112,6 +112,7 @@ def send_status_sorted(bot, chatid, case, status):
         16: '<b>Recebido no Brasil</b> 🇧🇷',
         17: '<b>Carteiro não atendido</b> 🚪',
         18: '<b>Objeto não chegou à unidade</b>',
+        19: '<b>Recebido na unidade de distribuição</b>',
     }
     if status:
         send_clean_msg(bot, chatid, cases.get(case) + status)
@@ -129,7 +130,7 @@ def list_by_status(chatid):
     cursor = list(db.search_packages_per_user(chatid))
     waiting_payment = get_packages_by_status('Aguardando pagamento', cursor, chatid)
     payed = get_packages_by_status('Pagamento confirmado', cursor, chatid)
-    not_available = get_packages_by_status('Aguardando recebimento pela ECT', cursor, chatid)
+    not_available = get_packages_by_status('Aguardando atualizações', cursor, chatid)
     no_payment = get_packages_by_status('Fiscalização aduaneira finalizada', cursor, chatid)
     in_transit = get_packages_by_status('Objeto em trânsito', cursor, chatid)
     delivery = get_packages_by_status('saiu para entrega', cursor, chatid)
@@ -143,8 +144,9 @@ def list_by_status(chatid):
     returned = get_packages_by_status('Devolução', cursor, chatid)
     customs = get_packages_by_status('aduaneira', cursor, chatid)
     received_br = get_packages_by_status('Correios do Brasil', cursor, chatid)
-    not_answered = get_packages_by_status('Carteiro não atendido', cursor, chatid)
+    not_answered = get_packages_by_status('arteiro não atendido', cursor, chatid)
     not_arrived = get_packages_by_status('Objeto ainda não chegou à unidade', cursor, chatid)
+    dist_unit = get_packages_by_status('Objeto recebido na unidade de distribuição', cursor, chatid)
     try:
         send_status_sorted(bot, chatid, 1, waiting_payment)
         send_status_sorted(bot, chatid, 2, payed)
@@ -164,8 +166,9 @@ def list_by_status(chatid):
         send_status_sorted(bot, chatid, 16, received_br)
         send_status_sorted(bot, chatid, 17, not_answered)
         send_status_sorted(bot, chatid, 18, not_arrived)
+        send_status_sorted(bot, chatid, 19, dist_unit)
     except Exception:
-        bot.send_message('9083329', 'Erro MongoBD')
+        bot.send_message('9083329', 'Erro MongoBD.')
         qtd = -1
 
 def list_packages(chatid, done, status):
@@ -199,7 +202,7 @@ def list_packages(chatid, done, status):
                         qtd = qtd + 1
                 else:
                     if not package_status_can_change(elem):
-                        aux = f"{aux}{elem['code']}"
+                        aux = f"{aux}/{elem['code']}"
                         try:
                             if elem[str(chatid)] != elem['code']:
                                 aux = f"{aux} <b>{elem[str(chatid)]}</b>"
@@ -207,8 +210,10 @@ def list_packages(chatid, done, status):
                             pass
                         aux = f"{aux}\n"
                         qtd = qtd + 1
-    except Exception:
+    except Exception as e:
         bot.send_message('9083329', 'Erro MongoBD')
+        print(e)
+        raise
         qtd = -1
     return aux, qtd
 
@@ -219,14 +224,14 @@ def add_package(code, user):
     '''
     code = code.upper()
     print("add_package")
-    stat = get_update(code)
+    stat = status.NOT_FOUND
     if stat in [status.OFFLINE, status.TYPO]:
         return stat
     else:
         stats = []
         stats.append(f"{POSTBOX} <b>{code}</b>")
         if stat == status.NOT_FOUND:
-            stats.append('Aguardando recebimento pela ECT.')
+            stats.append('Aguardando atualizações')
             stat = stats
         elif stat == status.NOT_FOUND_TM:
             stats.append(
@@ -255,9 +260,10 @@ def get_update(code):
     Update package tracking status
     '''
     print("get_update")
-    retorno = check_update(code)
-    print("check up: ", retorno)
-    return retorno
+    correios = Correios(CORREIOS_TOKEN)
+    retorno = asyncio.run(correios.get(code))
+    print("check up: ", retorno[code])
+    return retorno[code]
 
 
 def log_text(chatid, message_id, text):
@@ -334,7 +340,7 @@ def cmd_pacotes(message):
         if qtd > 7 and chatid > 0 and str(chatid) not in subscriber:
             bot.send_message(chatid,
                 str(u'\U0001F4B5') + '<b>Colabore!</b>'
-                + '\nPicPay: http://grf.xyz/picpay',
+                + '\nChave PIX: pix@rastreiobot.xyz',
                 parse_mode='HTML', reply_markup=markup_clean,
                 disable_web_page_preview=True)
 
@@ -556,6 +562,7 @@ def cmd_remove(message):
     try:
         code = message.text.split(' ')[1]
         code = code.replace('@', ' ')
+        code = code.upper()
         db.remove_user_from_package(code, message.chat.id)
         bot.send_message(message.chat.id, 'Pacote removido.')
     except Exception:
@@ -589,6 +596,14 @@ def cmd_cadastro_mercado_livre(message):
     bot.reply_to(message, url)
 
 
+@bot.message_handler(content_types=['pinned_message'])
+def on_pin(message):
+    if message.chat.id > 0:
+        try:
+            bot.delete_message(message.from_user.id, message.message_id)
+        except:
+            pass
+
 @bot.message_handler(func=lambda m: True)
 def cmd_magic(message):
     '''
@@ -607,8 +622,10 @@ def cmd_magic(message):
         .replace('/', '')
         .replace('📮', '')
         .strip()
-        .split()
     )
+    if '/start ' in message.text:
+        message_text = message_text.replace('_', ' ')
+    message_text = message_text.split()
 
     code = code_type = None
     for word in message_text:
@@ -622,6 +639,7 @@ def cmd_magic(message):
             break
 
     message_text = ' '.join(message_text)
+    print(code)
 
     try:
         desc = message_text.split('Data:')[0].replace('  ','')
@@ -635,7 +653,7 @@ def cmd_magic(message):
             subscriber = webhook.select_user('chatid', user)[1]
         except TypeError:
             subscriber = ''
-        if code_type != correios and user not in PATREON and user not in subscriber:
+        if code_type != Correios and user not in PATREON and user not in subscriber:
             bot.reply_to(message, msgs.typo, parse_mode='HTML', disable_web_page_preview=True)
             log_text(message.chat.id, message.message_id, 'Pacote chines. Usuario nao assinante.')
             return 0
@@ -644,12 +662,20 @@ def cmd_magic(message):
             if not db.package_has_user(code, user):
                 db.add_user_to_package(code, user)
             stats = db.package_status(code)
+            if desc != code:
+                db.set_package_description(code, user, desc)
+            try:
+                desc = db.get_package_desc(code, user)
+            except:
+                pass
             message = ''
             system = check_system_correios()
             for stat in stats:
                 message = message + '\n\n' + stat
             if not system:
                 message = (message + msgs.error_sys)
+            if code != desc:
+                message = message.replace(f'📮', f'📮 <b>{desc}</b>\n')
             if int(user) > 0:
                 bot.send_message(
                     user,
@@ -660,8 +686,6 @@ def cmd_magic(message):
                 )
             else:
                 send_clean_msg(bot, user, message)
-            if desc != code:
-                db.set_package_description(code, user, desc)
         else:
             stat = add_package(str(code), str(user))
             share_button = types.InlineKeyboardMarkup()
@@ -725,8 +749,11 @@ def cmd_magic(message):
             bot.delete_message(message.from_user.id, message.message_id)
         if int(user) > 0 and len(message.text) > 25:
             send_clean_msg(bot, message.from_user.id, msgs.invalid.format(message.from_user.id))
-        if bot.get_chat_member(message.chat.id, 102419067).status == 'administrator':
-            send_clean_msg(bot, message.chat.id, msgs.not_admin)
+        try:
+            if bot.get_chat_member(message.chat.id, 102419067).status == 'administrator':
+                send_clean_msg(bot, message.chat.id, msgs.not_admin)
+        except:
+            pass
 
 
 # sentry_url = config['SENTRY']['url']
@@ -734,4 +761,4 @@ def cmd_magic(message):
 #     sentry_sdk.init(sentry_url)
 
 if __name__ == "__main__":
-    bot.polling()
+    bot.infinity_polling()
